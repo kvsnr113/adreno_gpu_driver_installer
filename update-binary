@@ -1,0 +1,243 @@
+#!/sbin/sh
+
+# GPU Driver updater script by Zen.
+# TODO: Add a list that will use revert to remove files duing Install mode if the dev wishes.
+
+# Modified by 113
+
+export ZIPFILE="$3"
+export OUTDIR="/proc/self/fd/$2"
+export TMP="/tmp"
+export OLD_DRIVER="$TMP/old_driver"
+export UPDATE_FILES="$TMP/update_files"
+export PATH="$PATH:$TMP/update_files/utils"
+
+ui_print() {
+  echo "ui_print $1" > "$OUTDIR";
+  echo "ui_print" > "$OUTDIR";
+}
+
+#==============================================================================================
+
+# Try to auto mount vendor partition.
+mount_vendor_partition() {
+    if mountpoint -q "/vendor"; then
+        ui_print "Vendor partition is already mounted.."
+    else
+        ui_print "Trying to auto mount vendor partition..."
+    
+        mount /dev/block/bootdevice/by-name/vendor /vendor
+    
+        if mountpoint -q "/vendor"; then
+            ui_print "Mount successful."
+        else
+            ui_print "Failed to mount vendor partition automatically."
+            ui_print "Please mount it manually and try again."
+        exit 1;
+        fi
+    fi
+
+    # Make vendor partition writable if it isn't already.
+    mount -o rw,remount /vendor
+}
+
+
+# Check if vendor partition is writable.
+check_vendor_writable() {
+    if ! touch /vendor/test_file 2>/dev/null; then
+        ui_print "Vendor partition is not writable."
+        ui_print "Make sure your Vendor parititon is writable."
+        exit 1;
+    else
+        rm /vendor/test_file
+        ui_print "Vendor partition is writable."
+    fi
+}
+
+# Copy vendor files to $OLD_DRIVER directory
+copy_old_driver() {
+    ui_print "Copying old drivers..."
+    (
+        cd "$UPDATE_FILES"
+        find . -type d \( -name "META-INF" -o -name "utils" \) -prune -o -type f -print0 | while IFS= read -r -d '' file; do
+            target_file="$OLD_DRIVER${file#.}"
+            mkdir -p "$(dirname "$target_file")"
+            if ! cp "/vendor${file#.}" "$target_file"; then
+                echo "${file#.}" >> "$TMP/revert"
+            fi
+        done
+    )
+    ui_print "Finished copying old drivers"
+}
+
+
+
+check_vendor_space() {
+    # Don't check size if we have the flag in driver name.
+    [[ "$ZIPFILE" == *"no-size-check"* ]] && {
+        ui_print "Skipping size check of update files."
+    } || {
+        ui_print "Checking size requirement."
+        # Calculate size of new files.
+        NEW_FILES_SIZE=$(du -s "$UPDATE_FILES" | awk '{print $1}')
+        
+        # Check if vendor already has enough free space.
+        VENDOR_FREE_SPACE=$(df /vendor | awk 'END{print $4}')
+        VENDOR_USED_SPACE=$(df /vendor | awk 'END{print $3}')
+        VENDOR_TOTAL_SPACE=$(df /vendor | awk 'END{print $2}')
+        VENDOR_AVAILABLE_SPACE=$(df /vendor | awk 'END{print $5}')
+        
+        [[ "$NEW_FILES_SIZE" -le "$VENDOR_FREE_SPACE" ]] && {
+            ui_print "Vendor has sufficient free space."
+        } || {
+            ui_print "Vendor does not have enough free space."
+            ui_print "Calculating size of existing files in vendor..."
+            OLD_FILES_SIZE=$(du -sk "$OLD_DRIVER" | cut -f1)
+
+            ui_print "Vendor total size: $VENDOR_TOTAL_SPACE"
+            ui_print "Vendor used space: $VENDOR_USED_SPACE"
+            ui_print "Vendor free space: $VENDOR_FREE_SPACE"
+            ui_print "Vendor available space: $VENDOR_AVAILABLE_SPACE"
+            ui_print "Additional driver size: $OLD_FILES_SIZE KB."
+
+            # Check if new files can fit by replacing existing ones.
+            REQUIRED_SPACE=$(($NEW_FILES_SIZE - $OLD_FILES_SIZE))
+            [[ $REQUIRED_SPACE -le $VENDOR_FREE_SPACE ]] && {
+                ui_print "Driver can be installed by replacing existing files."
+            } || {
+                ui_print "Driver cannot be installed. Not enough space."
+                ui_print "New files require an additional $(($REQUIRED_SPACE - $VENDOR_FREE_SPACE)) KB free."
+                exit 1
+            }
+        }
+    }
+}
+
+
+
+# Remove leftovers.
+remove_leftovers() {
+    mv $UPDATE_FILES/revert $TMP/revert
+    local leftovers="$TMP/revert"
+    [[ -s "$leftovers" ]] && {
+        ui_print "Removing driver leftovers."
+        (
+            while IFS= read -r file; do
+                [[ -f "/vendor$file" ]] && rm "/vendor$file"
+            done < "$leftovers"
+        )
+        rm "$leftovers"
+    }
+}
+
+# Remove shader caches.
+remove_cache() {
+    ui_print "Removing shader caches."
+    (
+        find /data/user_de -name '*shaders_cache*' -type f -path '*code_cache*' -delete
+    )
+}
+
+# Remove temporary files.
+remove_temp() {
+    ui_print "Removing temporary files."
+
+    rm $TMP/revert
+    rm -rf $OLD_DRIVER
+    rm -rf $UPDATE_FILES
+    rm "/data/tmp/DriverRevertPackage_$(date +%F).zip"
+}
+
+
+#==================================================================================
+
+# Extract new files to tmp directory.
+ui_print "Extracting files from Driver Package..."
+mkdir -p $UPDATE_FILES
+mkdir -p $OLD_DRIVER
+unzip -o "$ZIPFILE" -d "$UPDATE_FILES"
+
+export DVER="A650-OGL/VK-@690-Hybrid"
+
+ui_print ""
+[[ -f "$UPDATE_FILES/revert" ]] && {
+	ui_print " • Adreno Driver | $DVER Revert Package"
+} || {
+	ui_print " • Adreno Driver | $DVER "
+}
+ui_print ""
+
+# Mount.
+mount_vendor_partition
+# Check RW.
+check_vendor_writable
+
+[[ -f "$UPDATE_FILES/revert" ]] && {
+    ui_print "Installing Revert Package..."
+    # We can remove leftovers first because those are not needed for our old driver.
+    remove_leftovers
+} || {
+	[[ "$ZIPFILE" == *"no-revert"* ]] && {
+    	ui_print "Skipping Revert Package creation."
+	} || {
+        touch $TMP/revert
+    }
+    ui_print "Installing Driver Package..."
+}
+
+# Copy old driver.
+copy_old_driver
+# Check size.
+check_vendor_space
+
+# Install Driver.
+# Finally install the drivers.
+ui_print "Installing..."
+
+# Loop through files in $UPDATE_FILES and copy them to /vendor.
+cd "$UPDATE_FILES"
+find . \( -path "./META-INF" -o -path "./utils" \) -prune -o -type f -print0 | while IFS= read -r -d '' file; do
+    # Always copy the file
+    cp -p -r "$file" "/vendor${file#.}"
+    # Set the context based on the file path
+    case "${file}" in
+        *"/firmware/"*)
+            chcon u:object_r:vendor_firmware_file:s0 "/vendor${file#.}"
+            ;;
+        *"/lib/"* | *"/lib64/"*)
+            chcon u:object_r:same_process_hal_file:s0 "/vendor${file#.}"
+            ;;
+    esac
+done
+
+ui_print "Installation successful."
+
+
+# Create Revert Package. (Subshell was causing problems so just bring it here)
+[[ -f "$TMP/revert" ]] && {
+    ui_print "Creating Revert Package."
+    # Add our zip binary to path.
+
+    # Copy META-INF directory to $OLD_DRIVER.
+    cp -p -R "$UPDATE_FILES/META-INF" "$OLD_DRIVER"
+    cp "$TMP/revert" "$OLD_DRIVER"
+
+    # Create the zip file in data/temp.
+    cd $OLD_DRIVER
+    zip -r "$TMP/DriverRevertPackage_$(date +%F).zip" .
+    if mv "$TMP/DriverRevertPackage_$(date +%F).zip" "/sdcard/"; then
+        ui_print "Revert Package created."
+        ui_print "Located at /sdcard/DriverRevertPackage_$(date +%F).zip"
+    else
+        ui_print "Error: Could not move Driver Revert Package"
+    fi
+    
+}
+
+# Remove Shader cache.
+remove_cache
+# Remove temporary files.
+remove_temp
+
+ui_print "Done."
+ui_print "Note: It may take longer to boot after flashing."
